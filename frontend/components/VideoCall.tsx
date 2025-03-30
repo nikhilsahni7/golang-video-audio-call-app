@@ -127,11 +127,11 @@ export default function VideoCall() {
     }
   }, [peers]);
 
-  // Enhanced reconnection function with proper debugging
+  // Enhanced reconnection function
   const forceReconnectWithPeers = () => {
     console.log("Force reconnecting with all peers...");
 
-    // Temporarily show a loading indicator
+    // Show a notification
     const reconnectionToast = document.createElement("div");
     reconnectionToast.textContent = "Reconnecting...";
     reconnectionToast.style.position = "fixed";
@@ -144,7 +144,7 @@ export default function VideoCall() {
     reconnectionToast.style.zIndex = "9999";
     document.body.appendChild(reconnectionToast);
 
-    // Close all existing peer connections
+    // Close all existing connections
     peers.forEach((peer) => {
       if (peer.connection) {
         console.log(`Closing connection to ${peer.id}`);
@@ -152,11 +152,9 @@ export default function VideoCall() {
       }
     });
 
-    // Give some time for connections to close
+    // Wait briefly then rejoin
     setTimeout(() => {
-      // Rejoin the same room to establish new connections
       handleJoinRoom(currentRoomId, isHost).finally(() => {
-        // Remove the toast after reconnection attempt
         setTimeout(() => {
           document.body.removeChild(reconnectionToast);
         }, 2000);
@@ -260,8 +258,8 @@ export default function VideoCall() {
                   peersWithStreams.length === 0 && (
                     <div className="mb-4 px-3 py-2 bg-orange-100 dark:bg-orange-900/30 text-orange-800 dark:text-orange-200 text-sm rounded-lg">
                       Connected to {peers.length} participant(s) but no video
-                      streams received yet. Try clicking &quot;Reconnect&quot;
-                      if this persists.
+                      streams received yet. Try clicking "Reconnect" if this
+                      persists.
                     </div>
                   )}
 
@@ -484,6 +482,14 @@ export default function VideoCall() {
               </details>
             </div>
           )}
+
+          <div className="mt-4 p-3 bg-gray-100 dark:bg-gray-700 rounded">
+            <h3 className="font-semibold">Connection Status:</h3>
+            <p>Socket Connected: {connected ? "Yes" : "No"}</p>
+            <p>Peers Count: {peers.length}</p>
+            <p>Peers with Video: {peersWithStreams.length}</p>
+            <p>Client ID: {clientId || "Not assigned"}</p>
+          </div>
         </div>
       )}
     </div>

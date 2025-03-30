@@ -23,6 +23,12 @@ var (
 			// Allow all connections for development
 			return true
 		},
+		// Add proper error handling for failed upgrades
+		Error: func(w http.ResponseWriter, r *http.Request, status int, reason error) {
+			util.Error("WebSocket upgrade error: %v, status: %d", reason, status)
+			// Send a more detailed error message to the client
+			http.Error(w, fmt.Sprintf("WebSocket upgrade failed: %v", reason), status)
+		},
 	}
 
 	// Create the signaling hub
@@ -153,6 +159,13 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
 
 // handleWebSocket handles WebSocket connections for signaling
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	// Set proper CORS headers for WebSocket handshake
+	origin := r.Header.Get("Origin")
+	if origin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+	}
+
 	// Get the room ID from the query parameters
 	roomID := r.URL.Query().Get("roomId")
 	if roomID == "" {
@@ -184,12 +197,23 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Upgrade the HTTP connection to a WebSocket
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		util.Error("Error upgrading to WebSocket: %v", err)
+		util.Error("Error upgrading to WebSocket for client %s: %v", clientID, err)
 		return
 	}
 
+	// Set proper ping/pong handlers to keep connection alive
+	conn.SetPingHandler(func(appData string) error {
+		util.Debug("Received ping from client %s", clientID)
+		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(10*time.Second))
+	})
+
+	conn.SetPongHandler(func(appData string) error {
+		util.Debug("Received pong from client %s", clientID)
+		return nil
+	})
+
 	// Create a new client with host status
-	signaling.NewClient(clientID, conn, hub, roomID)
+	_ = signaling.NewClient(clientID, conn, hub, roomID)
 
 	// Set host status if applicable
 	if isHost {

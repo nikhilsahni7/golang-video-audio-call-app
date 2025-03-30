@@ -18,6 +18,13 @@ interface SignalingMessage {
   };
 }
 
+// Add this at the top of the file after the SignalingMessage interface
+declare global {
+  interface RTCPeerConnection {
+    pendingIceCandidates?: RTCIceCandidate[];
+  }
+}
+
 // Configuration for WebRTC
 const rtcConfig = {
   iceServers: [
@@ -88,13 +95,44 @@ export function useWebRTC() {
   // Use a ref to maintain references across renders
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
 
+  // Track reconnection attempts
+  let reconnectAttempts = 0;
+
   // Send a message through the signaling channel
   const sendSignalingMessage = useCallback(
     (message: SignalingMessage) => {
-      if (socket && socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify(message));
+      if (!socket) {
+        console.error("Cannot send message, socket is null");
+        return;
+      }
+
+      if (socket.readyState === WebSocket.OPEN) {
+        try {
+          const msgString = JSON.stringify(message);
+          socket.send(msgString);
+          console.log(`Sent ${message.type} message to ${message.to || "all"}`);
+        } catch (err) {
+          console.error("Error sending message:", err);
+        }
       } else {
-        console.warn("Cannot send message, WebSocket is not open");
+        console.warn(
+          `Cannot send ${message.type} message, WebSocket state: ${
+            socket.readyState === WebSocket.CONNECTING
+              ? "CONNECTING"
+              : socket.readyState === WebSocket.CLOSING
+                ? "CLOSING"
+                : socket.readyState === WebSocket.CLOSED
+                  ? "CLOSED"
+                  : "UNKNOWN"
+          }`
+        );
+
+        // Try to detect network issues
+        if (navigator.onLine === false) {
+          console.error(
+            "User appears to be offline. Check network connection."
+          );
+        }
       }
     },
     [socket]
@@ -158,6 +196,9 @@ export function useWebRTC() {
           iceServers: rtcConfig.iceServers,
         });
 
+        // Initialize pendingIceCandidates array
+        peerConnection.pendingIceCandidates = [];
+
         // Enable trickle ICE
         peerConnection.onicecandidate = (event) => {
           if (!event.candidate) {
@@ -170,7 +211,7 @@ export function useWebRTC() {
             event.candidate.candidate.substring(0, 50) + "..."
           );
 
-          // Send ICE candidate to the peer immediately
+          // Create a new candidate object to avoid the null type issue
           const candidate = event.candidate as RTCIceCandidate;
           sendSignalingMessage({
             type: "ice-candidate",
@@ -305,52 +346,40 @@ export function useWebRTC() {
 
         // Listen for remote tracks
         peerConnection.ontrack = (event) => {
-          console.log(
-            `Received ${event.track.kind} track from ${peerId}`,
-            event
-          );
+          console.log(`Received ${event.track.kind} track from ${peerId}`);
 
-          // Make sure we have a stream associated with this track
           if (event.streams && event.streams[0]) {
             const remoteStream = event.streams[0];
+
+            // Log detailed information about the stream
             console.log(
-              `Updating peer ${peerId} with stream ID: ${remoteStream.id}, track ${event.track.kind}`
+              `Stream from ${peerId}: ID=${remoteStream.id}, active=${remoteStream.active}, ` +
+                `videoTracks=${remoteStream.getVideoTracks().length}, ` +
+                `audioTracks=${remoteStream.getAudioTracks().length}`
             );
 
-            // Check the stream's active status and available tracks
-            const hasVideoTracks = remoteStream.getVideoTracks().length > 0;
-            const hasAudioTracks = remoteStream.getAudioTracks().length > 0;
-            const isStreamActive = remoteStream.active;
+            // Debug each track
+            remoteStream.getTracks().forEach((track) => {
+              console.log(
+                `Track: ${track.kind}, ID: ${track.id}, enabled: ${track.enabled}, readyState: ${track.readyState}`
+              );
+            });
 
-            console.log(
-              `Stream from ${peerId} - active: ${isStreamActive}, video tracks: ${hasVideoTracks}, audio tracks: ${hasAudioTracks}`
-            );
-
-            // This ensures we get all tracks (audio and video)
+            // Important: Update the peer with the stream immediately
             updatePeer(peerId, {
               stream: remoteStream,
               isConnecting: false,
+              connectionState: peerConnection.connectionState,
             });
 
-            // Setup track ended handler
+            // Track ended handler
             event.track.onended = () => {
               console.log(
                 `Remote ${event.track.kind} track from ${peerId} ended`
               );
-
-              // If it's a video track, check if there are any video tracks left
-              if (event.track.kind === "video") {
-                const remainingVideoTracks = remoteStream
-                  .getVideoTracks()
-                  .filter((track) => track.readyState === "live");
-
-                if (remainingVideoTracks.length === 0) {
-                  console.log(`No remaining video tracks for peer ${peerId}`);
-                }
-              }
             };
 
-            // Setup track mute/unmute handler
+            // Track muted/unmuted handlers for debugging
             event.track.onmute = () => {
               console.log(
                 `Remote ${event.track.kind} track from ${peerId} muted`
@@ -429,6 +458,33 @@ export function useWebRTC() {
           console.log(`Setting remote description (offer) for ${peerId}`);
           await peerConnection.setRemoteDescription(offerSdp);
 
+          // Process any pending ICE candidates
+          if (
+            peerConnection.pendingIceCandidates &&
+            peerConnection.pendingIceCandidates.length > 0
+          ) {
+            console.log(
+              `Processing ${peerConnection.pendingIceCandidates.length} pending ICE candidates for ${peerId}`
+            );
+
+            const candidates = [...peerConnection.pendingIceCandidates];
+            peerConnection.pendingIceCandidates = [];
+
+            for (const candidate of candidates) {
+              try {
+                await peerConnection.addIceCandidate(candidate);
+                console.log(
+                  `Successfully added pending ICE candidate for ${peerId}`
+                );
+              } catch (err) {
+                console.error(
+                  `Error adding pending ICE candidate for ${peerId}:`,
+                  err
+                );
+              }
+            }
+          }
+
           console.log(`Creating answer for ${peerId}`);
           const answer = await peerConnection.createAnswer();
 
@@ -490,6 +546,34 @@ export function useWebRTC() {
       if (signalingState === "have-local-offer") {
         console.log(`Setting remote description (answer) for ${peerId}`);
         await peerConnection.setRemoteDescription(answerSdp);
+
+        // Process any pending ICE candidates
+        if (
+          peerConnection.pendingIceCandidates &&
+          peerConnection.pendingIceCandidates.length > 0
+        ) {
+          console.log(
+            `Processing ${peerConnection.pendingIceCandidates.length} pending ICE candidates for ${peerId}`
+          );
+
+          const candidates = [...peerConnection.pendingIceCandidates];
+          peerConnection.pendingIceCandidates = [];
+
+          for (const candidate of candidates) {
+            try {
+              await peerConnection.addIceCandidate(candidate);
+              console.log(
+                `Successfully added pending ICE candidate for ${peerId}`
+              );
+            } catch (err) {
+              console.error(
+                `Error adding pending ICE candidate for ${peerId}:`,
+                err
+              );
+            }
+          }
+        }
+
         console.log(`Connection setup complete for ${peerId}`);
       } else {
         console.warn(
@@ -500,6 +584,33 @@ export function useWebRTC() {
         if (signalingState === "stable") {
           console.log(`Attempting to apply late answer from ${peerId}`);
           await peerConnection.setRemoteDescription(answerSdp);
+
+          // Process any pending ICE candidates here too
+          if (
+            peerConnection.pendingIceCandidates &&
+            peerConnection.pendingIceCandidates.length > 0
+          ) {
+            console.log(
+              `Processing ${peerConnection.pendingIceCandidates.length} pending ICE candidates for ${peerId}`
+            );
+
+            const candidates = [...peerConnection.pendingIceCandidates];
+            peerConnection.pendingIceCandidates = [];
+
+            for (const candidate of candidates) {
+              try {
+                await peerConnection.addIceCandidate(candidate);
+                console.log(
+                  `Successfully added pending ICE candidate for ${peerId}`
+                );
+              } catch (err) {
+                console.error(
+                  `Error adding pending ICE candidate for ${peerId}:`,
+                  err
+                );
+              }
+            }
+          }
         }
       }
     } catch (error) {
@@ -543,6 +654,14 @@ export function useWebRTC() {
         return;
       }
 
+      // Make sure pendingIceCandidates is initialized
+      if (!peerConnection.pendingIceCandidates) {
+        peerConnection.pendingIceCandidates = [];
+      }
+
+      // Explicitly create a new RTCIceCandidate to avoid type issues
+      const candidate = new RTCIceCandidate(message.data.candidate);
+
       // Check if we have remote description set
       if (
         peerConnection.remoteDescription === null &&
@@ -552,13 +671,12 @@ export function useWebRTC() {
         console.warn(
           `Received ICE candidate before remote description for ${peerId}, queueing...`
         );
-        // We could implement a queue here for early ICE candidates
+        // Queue the candidate for later
+        peerConnection.pendingIceCandidates.push(candidate);
         return;
       }
 
       console.log(`Adding ICE candidate for ${peerId}`);
-      // Explicitly create a new RTCIceCandidate to avoid type issues
-      const candidate = new RTCIceCandidate(message.data.candidate);
       await peerConnection.addIceCandidate(candidate);
       console.log(`Successfully added ICE candidate for ${peerId}`);
     } catch (error) {
@@ -617,14 +735,26 @@ export function useWebRTC() {
             // Create connection and add to peers
             const connection = createPeerConnection(message.from);
 
-            // Always initiate an offer when someone joins to ensure connection
+            // Use a deterministic approach to decide who initiates
             if (connection) {
-              // Add a small delay to ensure both peers are ready
-              const peerId = message.from; // Capture peerId to avoid TypeScript errors
-              setTimeout(() => {
-                console.log(`Initiating offer to new participant: ${peerId}`);
-                createOffer(peerId, connection);
-              }, 1000);
+              const currentClientId = useVideoCallStore.getState().clientId;
+              const peerId = message.from;
+
+              // If our ID is lexicographically smaller, we initiate
+              if (
+                currentClientId &&
+                currentClientId.localeCompare(peerId) < 0
+              ) {
+                // Add a small delay to ensure both peers are ready
+                setTimeout(() => {
+                  console.log(`Initiating offer to new participant: ${peerId}`);
+                  createOffer(peerId, connection);
+                }, 1000);
+              } else {
+                console.log(
+                  `Waiting for offer from new participant: ${peerId}`
+                );
+              }
             }
           }
           break;
@@ -647,15 +777,27 @@ export function useWebRTC() {
                 );
                 const connection = createPeerConnection(userId);
 
-                // For existing users, the host should always initiate
-                const currentIsHost = useVideoCallStore.getState().isHost;
-                if (currentIsHost && connection) {
-                  setTimeout(() => {
+                // Both sides should initiate offers to ensure connection
+                // Instead of only host initiating, use a deterministic approach
+                // where the "lower" client ID initiates to the "higher" one
+                if (connection) {
+                  const currentClientId = useVideoCallStore.getState().clientId;
+                  // If our ID is lexicographically smaller, we initiate
+                  if (
+                    currentClientId &&
+                    currentClientId.localeCompare(userId) < 0
+                  ) {
+                    setTimeout(() => {
+                      console.log(
+                        `Initiating offer to existing participant: ${userId}`
+                      );
+                      createOffer(userId, connection);
+                    }, 1000);
+                  } else {
                     console.log(
-                      `Host initiating offer to existing participant: ${userId}`
+                      `Waiting for offer from existing participant: ${userId}`
                     );
-                    createOffer(userId, connection);
-                  }, 1500);
+                  }
                 }
               }
             });
@@ -705,6 +847,9 @@ export function useWebRTC() {
   const joinRoom = useCallback(
     async (newRoomId: string, asHost: boolean = false) => {
       try {
+        // Reset reconnect attempt counter on new join
+        reconnectAttempts = 0;
+
         console.log(
           `Joining room: ${newRoomId} as ${asHost ? "host" : "participant"}`
         );
@@ -788,7 +933,7 @@ export function useWebRTC() {
         const baseUrl = process.env.NEXT_PUBLIC_API_URL || "localhost:8080";
         const wsUrl = `${protocol}//${baseUrl}/ws?roomId=${newRoomId}${
           asHost ? "&isHost=true" : ""
-        }${isLocalTesting ? "&debug=true" : ""}`;
+        }${isLocalTesting ? "&debug=true&clientTime=" + Date.now() : ""}`;
 
         // Close existing socket if any
         if (socket) {
@@ -832,8 +977,101 @@ export function useWebRTC() {
             clearTimeout(connectionTimeout);
           }
 
-          console.log("Sending join message for room:", newRoomId);
-          sendJoinMessage();
+          // Wait a brief moment before sending join message to ensure socket is ready
+          setTimeout(() => {
+            if (newSocket.readyState === WebSocket.OPEN) {
+              console.log("Sending join message for room:", newRoomId);
+              // Send join message directly, don't use the callback that might use a stale socket ref
+              newSocket.send(
+                JSON.stringify({
+                  type: "join",
+                  data: { roomId: newRoomId },
+                })
+              );
+            } else {
+              console.error("Socket not open when trying to send join message");
+              // Try reconnecting
+              if (newSocket.readyState === WebSocket.CLOSED) {
+                console.log("Attempting to reconnect...");
+                reconnectSocket(newRoomId, asHost, stream);
+              }
+            }
+          }, 500);
+        };
+
+        // Add a helper function for reconnecting
+        const reconnectSocket = (
+          roomId: string,
+          asHost: boolean,
+          stream: MediaStream
+        ) => {
+          console.log(`Reconnecting socket for room: ${roomId}...`);
+          const protocol =
+            window.location.protocol === "https:" ? "wss:" : "ws:";
+          const baseUrl = process.env.NEXT_PUBLIC_API_URL || "localhost:8080";
+          const isLocalTesting =
+            window.location.hostname === "localhost" ||
+            window.location.hostname === "127.0.0.1";
+
+          // Store the current room ID in local store to ensure consistency
+          setRoomId(roomId);
+
+          const wsUrl = `${protocol}//${baseUrl}/ws?roomId=${roomId}${
+            asHost ? "&isHost=true" : ""
+          }${isLocalTesting ? "&debug=true&clientTime=" + Date.now() : ""}`;
+
+          console.log(`Reconnecting to URL: ${wsUrl}`);
+          const reconnectSocket = new WebSocket(wsUrl);
+          setSocket(reconnectSocket);
+
+          reconnectSocket.onopen = () => {
+            console.log(`Reconnected to signaling server for room: ${roomId}`);
+            setConnected(true);
+
+            // Send join message
+            if (reconnectSocket.readyState === WebSocket.OPEN) {
+              console.log(
+                `Sending join message after reconnect for room: ${roomId}`
+              );
+              reconnectSocket.send(
+                JSON.stringify({
+                  type: "join",
+                  data: { roomId },
+                })
+              );
+            }
+          };
+
+          // Set the same event handlers as the original socket
+          reconnectSocket.onmessage = newSocket.onmessage;
+          reconnectSocket.onerror = newSocket.onerror;
+          reconnectSocket.onclose = (event) => {
+            console.log(
+              `Reconnected socket disconnected: ${event.code} ${event.reason}`
+            );
+
+            // If we still have abnormal closures, try again with exponential backoff
+            if (event.code === 1006) {
+              const backoffDelay = Math.min(
+                4000,
+                1000 * Math.pow(2, reconnectAttempts)
+              );
+              reconnectAttempts++;
+              console.log(
+                `Retry attempt ${reconnectAttempts}, waiting ${backoffDelay}ms...`
+              );
+
+              setTimeout(() => {
+                if (stream && stream.active) {
+                  reconnectSocket(roomId, asHost, stream);
+                } else {
+                  console.warn("Stream no longer active, cannot reconnect");
+                }
+              }, backoffDelay);
+            } else {
+              reconnectAttempts = 0;
+            }
+          };
         };
 
         newSocket.onmessage = (event) => {
@@ -856,7 +1094,9 @@ export function useWebRTC() {
         newSocket.onerror = (error) => {
           console.error("WebSocket error:", error);
           setConnected(false);
-          alert("Connection error. Please try again.");
+
+          // Don't show alert immediately to avoid flooding user with messages
+          console.log("Connection error, will try to reconnect automatically");
         };
 
         newSocket.onclose = (event) => {
@@ -866,6 +1106,18 @@ export function useWebRTC() {
           setConnected(false);
           if (connectionTimeout) {
             clearTimeout(connectionTimeout);
+          }
+
+          // Try to reconnect automatically after a delay if abnormal closure or network error
+          if (event.code === 1006) {
+            console.log(
+              "Abnormal closure, attempting to reconnect in 2 seconds..."
+            );
+            setTimeout(() => {
+              if (stream) {
+                reconnectSocket(newRoomId, asHost, stream);
+              }
+            }, 2000);
           }
         };
 
@@ -922,6 +1174,31 @@ export function useWebRTC() {
       disconnect();
     };
   }, [disconnect]);
+
+  // Add effect for network status changes
+  useEffect(() => {
+    // Function to handle when browser goes online
+    const handleOnline = () => {
+      console.log("Browser is now online");
+
+      // If we have a room ID but no active connection, try to reconnect
+      if (roomId && !connected && localStream) {
+        console.log("Attempting to reconnect after network reconnection");
+        // Use a timeout to avoid immediate reconnection that might fail
+        setTimeout(() => {
+          joinRoom(roomId, useVideoCallStore.getState().isHost);
+        }, 1000);
+      }
+    };
+
+    // Add network status event listeners
+    window.addEventListener("online", handleOnline);
+
+    // Cleanup function
+    return () => {
+      window.removeEventListener("online", handleOnline);
+    };
+  }, [roomId, connected, localStream, joinRoom]);
 
   // Return the public API
   return {

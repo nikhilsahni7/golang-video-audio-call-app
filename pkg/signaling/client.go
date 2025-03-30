@@ -139,7 +139,7 @@ func (c *Client) SetHost(isHost bool) {
 }
 
 // Send sends a message to the client
-func (c *Client) Send(msg *Message) {
+func (c *Client) Send(message *Message) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
@@ -148,7 +148,7 @@ func (c *Client) Send(msg *Message) {
 	}
 
 	select {
-	case c.send <- msg:
+	case c.send <- message:
 	default:
 		// Buffer full, close connection
 		util.Warn("Message buffer full for client %s, closing connection", c.ID)
@@ -233,8 +233,27 @@ func (c *Client) readPump() {
 		switch msg.Type {
 		case "offer", "answer", "ice-candidate":
 			// For WebRTC signaling, broadcast to the room
-			util.Debug("Received %s from client %s", msg.Type, c.ID)
-			c.Room.Broadcast(&msg, c.ID)
+			util.Debug("Received %s from client %s to %s", msg.Type, c.ID, msg.To)
+
+			// If the message has a specific recipient, send only to that recipient
+			if msg.To != "" {
+				// Find the recipient client
+				recipientFound := false
+				for _, client := range c.Room.GetClients() {
+					if client.ID == msg.To {
+						client.Send(&msg)
+						recipientFound = true
+						util.Debug("Sent direct %s from %s to %s", msg.Type, c.ID, msg.To)
+						break
+					}
+				}
+				if !recipientFound {
+					util.Warn("Recipient %s not found for %s from %s", msg.To, msg.Type, c.ID)
+				}
+			} else {
+				// If no specific recipient, broadcast to all in the room (except sender)
+				c.Room.Broadcast(&msg, c.ID)
+			}
 		case "chat":
 			// For chat messages, broadcast to the room
 			util.Debug("Received chat message from client %s", c.ID)

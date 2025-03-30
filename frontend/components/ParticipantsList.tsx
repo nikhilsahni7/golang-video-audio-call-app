@@ -8,7 +8,7 @@ import {
   VideoCameraIcon,
   VideoCameraSlashIcon,
 } from "@heroicons/react/24/solid";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Peer } from "../lib/store";
 
 interface ParticipantsListProps {
@@ -43,6 +43,11 @@ export default function ParticipantsList({
         peer.id.toLowerCase().includes(searchQuery.toLowerCase())
       )
     : activePeers;
+
+  // Add this effect to refresh the component when peers change
+  useEffect(() => {
+    console.log("ParticipantsList updated with", peers.length, "peers");
+  }, [peers]);
 
   return (
     <div className="bg-white dark:bg-gray-800 rounded-xl shadow-md overflow-hidden">

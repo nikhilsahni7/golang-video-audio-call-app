@@ -53,6 +53,16 @@ func (r *Room) AddClient(client *Client) {
 		})
 	}
 
+	// Log detailed information about current room state
+	userList := make([]string, 0, len(r.clients))
+	for clientID := range r.clients {
+		if clientID != client.ID {
+			userList = append(userList, clientID)
+		}
+	}
+	util.Info("Room %s state - clients: %v, host: %s, new client: %s",
+		r.ID, userList, r.hostID, client.ID)
+
 	util.Info("Client %s joined room %s", client.ID, r.ID)
 }
 
@@ -179,24 +189,41 @@ func (r *Room) broadcastLoop() {
 		r.clientMutex.RLock()
 		recipientCount := 0
 
-		// Create a list of clients to send to (to avoid blocking during send)
-		clientsToSend := make([]*Client, 0, len(r.clients))
-		for _, client := range r.clients {
-			// Skip the sender if specified
-			if msg.From == client.ID && msg.From != "" {
-				continue
+		// Handle targeted messages first
+		if msg.To != "" {
+			// Send to a specific recipient
+			if client, exists := r.clients[msg.To]; exists {
+				client.Send(msg)
+				recipientCount = 1
+				util.Debug("Sent targeted message type=%s from=%s to %s in room %s",
+					msg.Type, msg.From, msg.To, r.ID)
+			} else {
+				util.Warn("Unable to find recipient %s for message type=%s in room %s",
+					msg.To, msg.Type, r.ID)
 			}
-			clientsToSend = append(clientsToSend, client)
+		} else {
+			// Create a list of clients to send to (to avoid blocking during send)
+			clientsToSend := make([]*Client, 0, len(r.clients))
+			for _, client := range r.clients {
+				// Skip the sender if specified
+				if msg.From == client.ID && msg.From != "" {
+					continue
+				}
+				clientsToSend = append(clientsToSend, client)
+			}
+			r.clientMutex.RUnlock()
+
+			// Send to each client
+			for _, client := range clientsToSend {
+				client.Send(msg)
+				recipientCount++
+			}
+
+			util.Debug("Broadcasted message type=%s from=%s to %d clients in room %s",
+				msg.Type, msg.From, recipientCount, r.ID)
+			continue
 		}
+
 		r.clientMutex.RUnlock()
-
-		// Send to each client
-		for _, client := range clientsToSend {
-			client.Send(msg)
-			recipientCount++
-		}
-
-		util.Debug("Broadcasted message type=%s from=%s to %d clients in room %s",
-			msg.Type, msg.From, recipientCount, r.ID)
 	}
 }
